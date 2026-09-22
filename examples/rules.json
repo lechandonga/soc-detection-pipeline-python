@@ -1,0 +1,40 @@
+[
+  {
+    "rule_id": "brute-force-ssh",
+    "name": "SSH 登录爆破",
+    "rule_type": "threshold",
+    "group_by": ["src_ip"],
+    "suppression_key": ["src_ip"],
+    "threshold": {
+      "count": 5,
+      "window_seconds": 300,
+      "event_types": ["ssh.auth_fail"],
+      "align_window": true
+    }
+  },
+  {
+    "rule_id": "scan-then-login",
+    "name": "先扫描后登录成功（攻陷链）",
+    "rule_type": "sequence",
+    "group_by": ["src_ip", "dst_ip"],
+    "sequence": {
+      "window_seconds": 600,
+      "steps": [
+        {"name": "scan", "event_type": "port.scan"},
+        {"name": "login", "event_type": "ssh.auth_ok"}
+      ]
+    }
+  },
+  {
+    "rule_id": "known-bad-signature",
+    "name": "命中特定 IDS 签名",
+    "rule_type": "threshold",
+    "group_by": ["src_ip"],
+    "threshold": {
+      "count": 1,
+      "window_seconds": 60,
+      "filter_attr": "attr.signature_id",
+      "filter_value": "S-2026-0922"
+    }
+  }
+]

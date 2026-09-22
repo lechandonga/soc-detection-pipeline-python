@@ -1,0 +1,3 @@
+{"event_id": "evt-001", "source": "ids", "event_type": "ssh.auth_fail", "severity": "medium", "event_time": "2026-09-22T10:00:01Z", "src_ip": "10.0.0.9", "dst_ip": "10.0.1.5", "asset_id": "host-web-1"}
+{"event_id": "evt-002", "source": "ids", "event_type": "ssh.auth_fail", "severity": "medium", "event_time": "2026-09-22T10:00:10Z", "src_ip": "10.0.0.9", "dst_ip": "10.0.1.5", "asset_id": "host-web-1"}
+{"event_id": "evt-003", "source": "ids", "event_type": "ssh.auth_fail", "severity": "medium", "event_time": "2026-09-22T10:00:20Z", "src_ip": "10.0.0.9", "dst_ip": "10.0.1.5", "asset_id": "host-web-1"}
