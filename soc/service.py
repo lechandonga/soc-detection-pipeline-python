@@ -39,6 +39,14 @@ from soc.rules import RuleSet, build_ruleset
 from soc.store import Store
 from soc.enrichment import LocalIntelProvider
 
+# Alert states considered "still pending work" for the default browse view.
+# Alerts closed by a human or by rule retirement are excluded unless the
+# caller asks for an explicit state.
+PENDING_STATES: frozenset[AlertState] = frozenset({
+    AlertState.OPEN, AlertState.ACKNOWLEDGED, AlertState.SUPPRESSED,
+    AlertState.RESOLVED,
+})
+
 
 class DetectionService:
     def __init__(self, *, config: PipelineConfig | None = None,
@@ -225,6 +233,14 @@ class DetectionService:
         rep = firing.events[-1]
         lane_alert = self.lane_alert.get(lane_id)
         if lane_alert is None or lane_alert.state is AlertState.CLOSED:
+            prior = self.alerts_by_key.get(firing.match_key)
+            if prior is not None and prior.state is AlertState.CLOSED:
+                # This exact conclusion was already concluded terminally
+                # (typically because its rule was retired). Re-enabling a
+                # rule must not resurrect it or mint a duplicate alert for
+                # the same basis. The closed alert stays the lane's only
+                # conclusion; a genuinely new firing has a new match_key.
+                return prior
             alert = Alert(
                 id=firing.match_key, dedup_key=lane_id,
                 rule_id=firing.rule_id, severity=severity,
@@ -273,17 +289,31 @@ class DetectionService:
     # ============================================================= rules
     def replace_rules(self, docs: list[dict],
                       suppressions: list[dict] | None = None) -> dict:
-        """Validate everything, then atomically swap the live rule snapshot."""
+        """Validate everything, then atomically swap and retire withdrawn rules.
+
+        Retirement is part of the same atomic commit: a rule present and
+        enabled in the old snapshot but missing (``deleted``) or present with
+        ``enabled: false`` (``disabled``) in the new snapshot is retired.
+        Every alert it produced is concluded CLOSED with a ``rule_retire``
+        history record. Validation of the whole new document set happens
+        first, so an invalid configuration is rejected wholesale and no
+        retirement conclusion is ever half-applied.
+        """
+        # Validate BEFORE taking the lock / touching anything; a bad config
+        # must leave the previous ruleset and every alert exactly as they
+        # were (no half retirement).
+        candidate = build_ruleset(docs, version=self.ruleset.version + 1,
+                                  max_rules=self.config.max_rules)
+        parsed_supp: dict[str, Suppression] = {}
+        for doc in suppressions or []:
+            supp = Suppression.from_dict(doc)
+            if supp.id in parsed_supp:
+                raise DuplicateRuleError(
+                    "duplicate suppression id", details={"id": supp.id})
+            parsed_supp[supp.id] = supp
+
         with self._lock:
-            candidate = build_ruleset(docs, version=self.ruleset.version + 1,
-                                      max_rules=self.config.max_rules)
-            parsed_supp: dict[str, Suppression] = {}
-            for doc in suppressions or []:
-                supp = Suppression.from_dict(doc)
-                if supp.id in parsed_supp:
-                    raise DuplicateRuleError(
-                        "duplicate suppression id", details={"id": supp.id})
-                parsed_supp[supp.id] = supp
+            retired = self._diff_retirements(candidate)
 
             # Rebuild lane index for the new rule definitions from retained
             # events (pure function of events), prune by lateness, then
@@ -306,9 +336,59 @@ class DetectionService:
             self.ruleset = candidate
             self.suppressions = parsed_supp
             self._run_all_detection(candidate)
+            self._retire_alerts(candidate.version, retired)
             return {"version": candidate.version,
                     "rule_count": len(candidate.rules),
-                    "suppression_count": len(parsed_supp)}
+                    "suppression_count": len(parsed_supp),
+                    "retired_rule_ids": sorted(retired)}
+
+    def _diff_retirements(self, candidate: RuleSet) -> dict[str, str]:
+        """rule_id -> 'deleted' | 'disabled' for rules withdrawn now.
+
+        Only a rule that was present *and enabled* in the live snapshot can
+        be retired by this commit. A rule that was already disabled stays in
+        its previously retired state: re-disabling or keeping it disabled is
+        a no-op (no repeated, contradictory retirement records).
+        """
+        retired: dict[str, str] = {}
+        for old in self.ruleset.rules:
+            if not old.enabled:
+                continue  # already retired in an earlier commit
+            new = candidate.get(old.id)
+            if new is None:
+                retired[old.id] = "deleted"
+            elif not new.enabled:
+                retired[old.id] = "disabled"
+        return retired
+
+    def _retire_alerts(self, rule_version: int,
+                       retired: dict[str, str]) -> int:
+        """Close every non-terminal alert of each retired rule.
+
+        Terminal alerts (already closed by a human or an earlier retirement)
+        are left untouched. Commands are journaled before the in-memory
+        change, so restart replay reproduces the exact same conclusions and
+        replaying the journal a second time converges identically.
+        """
+        from soc.alerts import RETIRE_REASON
+        closed = 0
+        if not retired:
+            return closed
+        ts = self._clock()
+        # Stable order keeps the journal (and any logs) deterministic.
+        for alert in sorted(self.alert_index.values(),
+                            key=lambda a: (a.created_ts, a.id)):
+            detail = retired.get(alert.rule_id)
+            if detail is None or alert.state is AlertState.CLOSED:
+                continue
+            cmd = {"type": "transition", "alert_id": alert.id,
+                   "action": "rule_retire", "reason": RETIRE_REASON,
+                   "detail": detail, "rule_version": rule_version, "ts": ts,
+                   "from_state": alert.state.value}
+            self.store.append_alert_command(cmd)
+            alert.transition("rule_retire", ts=ts, reason=detail)
+            closed += 1
+        return closed
 
     # ========================================================== lifecycle
     def transition_alert(self, alert_id: str, action: str,
@@ -345,6 +425,11 @@ class DetectionService:
             alerts = list(self.alert_index.values())
             if state:
                 alerts = [a for a in alerts if a.state.value == state]
+            else:
+                # Default browse view: only alerts with pending work.
+                # Closed alerts (manual close or rule retirement) remain
+                # fully fetchable by id or via ?state=closed.
+                alerts = [a for a in alerts if a.state in PENDING_STATES]
             return [a.to_dict() for a in sorted(
                 alerts, key=lambda a: (a.created_ts, a.id))]
 
@@ -397,8 +482,22 @@ class DetectionService:
             self._index_event(event, self.ruleset)
             self._run_detection_replay_event(event, self.ruleset)
 
-        for cmd in self.store.read_alert_commands():
+        # Replay the command journal in a total order. Retirement commands
+        # may interleave with human lifecycle commands; ordering by (ts,
+        # journal position) preserves the real "who happened first"
+        # ordering so the final winner is unique and reproducible.
+        commands = list(self.store.read_alert_commands())
+        for pos, cmd in enumerate(commands):
+            cmd["_pos"] = pos
+        commands.sort(key=lambda c: (c["ts"], c["_pos"]))
+        for cmd in commands:
             self._replay_command(cmd)
+
+        # Safety net / pure re-derivation: conclusions implied by the final
+        # configuration (rules withdrawn) are also recomputed. This is a
+        # no-op when the journal is complete and keeps a second replay of
+        # the same journals convergent.
+        self._rebuild_retirements()
 
     def _run_detection_replay_event(self, event, ruleset: RuleSet) -> None:
         from soc.models import Event
@@ -414,19 +513,96 @@ class DetectionService:
     def _replay_command(self, cmd: dict) -> None:
         ctype = cmd["type"]
         if ctype == "create":
-            return  # alert objects were already regenerated by detection
+            # Detection regenerates alerts for rules still present in the
+            # final snapshot. Alerts of retired (deleted/disabled) rules
+            # cannot be regenerated that way, so restore them from their
+            # durable create command with CLOSED-immune creation.
+            if cmd["match_key"] in self.alerts_by_key:
+                return
+            self._restore_created_alert(cmd)
+            return
         if ctype == "transition":
             alert = self.alert_index.get(cmd["alert_id"])
             if alert is None:
                 return
             from soc.errors import InvalidStateTransitionError
             try:
-                alert.transition(cmd["action"], ts=cmd["ts"],
-                                 reason=cmd.get("reason", ""))
+                action = cmd["action"]
+                reason = (cmd.get("detail") if action == "rule_retire"
+                          else cmd.get("reason", ""))
+                alert.transition(action, ts=cmd["ts"], reason=reason)
             except InvalidStateTransitionError:
                 # Already in the target / a terminal state: replaying the
                 # journal repeatedly must converge to identical state.
                 pass
+
+    def _restore_created_alert(self, cmd: dict) -> None:
+        """Rebuild an Alert object from a journaled create command."""
+        from soc.models import Event
+        evidence_d = cmd.get("evidence") or {}
+        evidence = self._evidence_from_dict(evidence_d)
+        rep = None
+        last_id = (evidence.event_ids[-1] if evidence.event_ids else None)
+        if last_id is not None and last_id in self.events_by_id:
+            rep = Event(**self.events_by_id[last_id])
+        created_ts = cmd.get("ts", 0.0)
+        alert = Alert(
+            id=cmd["match_key"], dedup_key=cmd.get("lane_id",
+                                                  f"{cmd['rule_id']}|"),
+            rule_id=cmd["rule_id"], severity=cmd.get("severity", "medium"),
+            state=AlertState.OPEN, created_ts=created_ts,
+            updated_ts=created_ts,
+            event_count=len(evidence.event_ids),
+            evidence=[evidence], representative_event=rep)
+        self.alerts_by_key[alert.id] = alert
+        self.alert_index[alert.id] = alert
+        # Do not repopulate lane_alert: a retired rule must never have its
+        # old alert revived by later detection, and a re-enabled rule
+        # starts a fresh lane (a genuinely new firing gets a new id).
+
+    @staticmethod
+    def _evidence_from_dict(data: dict):
+        from soc.alerts import Evidence
+        return Evidence(
+            rule_id=data.get("rule_id", ""),
+            rule_version=data.get("rule_version", 0),
+            group_key=data.get("group_key", ""),
+            window_seconds=float(data.get("window_seconds", 0.0)),
+            event_ids=tuple(data.get("event_ids", [])),
+            basis=tuple((float(ts), int(seq))
+                        for ts, seq in data.get("basis", [])))
+
+    def _rebuild_retirements(self) -> None:
+        """Re-derive rule-retirement conclusions without the journal.
+
+        Retirement is a pure consequence of the final rule configuration
+        versus the alerts the stream produced: any enabled-in-history rule
+        that is absent or disabled in the final snapshot must have all its
+        alerts CLOSED. Commands in ``alerts.jsonl`` (including retirements
+        interleaved with human actions) are replayed afterwards in ts/id
+        order, so the winner is always whichever conclusion was recorded
+        first. Running this before the command replay is idempotent and
+        converges: the journal applies the identical terminal outcome.
+        """
+        from soc.alerts import RETIRE_REASON
+        retired: dict[str, str] = {}
+        current = self.ruleset
+        # Rules that produced alerts but are gone/disabled in the final
+        # configuration are retired by the final snapshot.
+        rule_ids = {a.rule_id for a in self.alert_index.values()}
+        for rid in rule_ids:
+            rule = current.get(rid)
+            if rule is None:
+                retired[rid] = "deleted"
+            elif not rule.enabled:
+                retired[rid] = "disabled"
+        for alert in sorted(self.alert_index.values(),
+                            key=lambda a: (a.created_ts, a.id)):
+            detail = retired.get(alert.rule_id)
+            if detail is None or alert.state is AlertState.CLOSED:
+                continue
+            alert.transition("rule_retire", ts=alert.updated_ts,
+                             reason=detail)
 
 
 def _default_clock() -> float:

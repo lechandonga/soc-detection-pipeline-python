@@ -16,6 +16,16 @@ Lifecycle::
 Illegal transitions raise :class:`InvalidStateTransitionError` with a
 distinct reason; repeated recovery (resolve) / close of the same alert is
 idempotent so replaying an event stream never produces contradictory state.
+
+Rule retirement
+---------------
+Deleting a rule or flipping its ``enabled`` flag off *retires* it. Every
+alert the retired rule ever produced is then concluded with the
+``rule_retire`` action into CLOSED with reason ``rule_retired``; the
+history detail distinguishes ``deleted`` from ``disabled``. This is a
+retirement conclusion, not a human close, and the two stay distinguishable
+in the audit trail. It is terminal/idempotent and never reopens or appends
+duplicate records; alerts a human already closed stay exactly as they were.
 """
 from __future__ import annotations
 
@@ -45,7 +55,14 @@ TRANSITIONS: dict[str, frozenset[AlertState]] = {
     "unsuppress": frozenset({AlertState.SUPPRESSED}),
     "close": frozenset({AlertState.OPEN, AlertState.ACKNOWLEDGED,
                         AlertState.SUPPRESSED, AlertState.RESOLVED}),
+    # System action emitted when the producing rule is retired.
+    "rule_retire": frozenset({AlertState.OPEN, AlertState.ACKNOWLEDGED,
+                              AlertState.SUPPRESSED, AlertState.RESOLVED}),
 }
+
+# Stable reason recorded on retirement conclusions, kept distinct from a
+# human-entered close reason.
+RETIRE_REASON = "rule_retired"
 
 
 @dataclass(frozen=True)
@@ -119,6 +136,11 @@ class Alert:
     representative_event: Any = field(default=None, compare=False)
     # when this lane became RESOLVED (kept for coherent reopen/close)
     resolved_ts: float | None = None
+    # How the alert reached CLOSED: "manual" (human close) or
+    # "rule_retire" (producing rule retired); None while not closed.
+    closed_by: str | None = None
+    # Retirement detail: "deleted" or "disabled" ("" for a manual close).
+    closure_detail: str = ""
 
     # ----------------------------------------------------- lifecycle
     def transition(self, action: str, *, ts: float,
@@ -128,6 +150,11 @@ class Alert:
         if action == "resolve" and current is AlertState.RESOLVED:
             return
         if action == "close" and current is AlertState.CLOSED:
+            return
+        # Retirement is idempotent on every terminal alert: a human close or
+        # a prior retirement both win over a repeated retirement command,
+        # and no contradictory history record is appended.
+        if action == "rule_retire" and current is AlertState.CLOSED:
             return
         if action not in TRANSITIONS:
             raise InvalidStateTransitionError(
@@ -148,6 +175,7 @@ class Alert:
             "suppress": AlertState.SUPPRESSED,
             "unsuppress": AlertState.OPEN,
             "close": AlertState.CLOSED,
+            "rule_retire": AlertState.CLOSED,
         }[action]
         self.state = new_state
         self.updated_ts = ts
@@ -155,6 +183,11 @@ class Alert:
             self.resolved_ts = ts
         elif action == "reopen":
             self.resolved_ts = None
+        if action == "rule_retire":
+            self.closed_by = "rule_retire"
+            self.closure_detail = reason or self.closure_detail
+        elif action == "close":
+            self.closed_by = self.closed_by or "manual"
         if action == "suppress":
             self.suppressed_by = reason or self.suppressed_by
         elif action == "unsuppress":
@@ -183,6 +216,8 @@ class Alert:
             "occurrences": self.occurrences,
             "suppressed_by": self.suppressed_by,
             "resolved_ts": self.resolved_ts,
+            "closed_by": self.closed_by,
+            "closure_detail": self.closure_detail,
             "evidence": [e.to_dict() for e in self.evidence],
             "history": list(self.history),
             "enrichment": dict(self.enrichment),
