@@ -14,10 +14,23 @@ Determinism model
 -----------------
 Detection is a pure function of ``(rule_version, rule_id, group_key,
 sorted events)`` and every firing has a stable ``match_key``. On startup the
-service rebuilds from the append-only journals: ingested events replay
-through detection and alert commands replay over the resulting alerts,
-yielding identical alerts / counts / lifecycle states. Replaying the same
-event stream a second time changes nothing (ids and match_keys dedupe).
+service rebuilds from the append-only journals: ingested events are
+re-indexed into lanes and the alert command journal (create / transition)
+is replayed in order, yielding identical alerts / counts / lifecycle
+states - including alerts whose rule has since been retired. Replaying the
+same journals a second time changes nothing (ids and match_keys dedupe,
+closes are idempotent).
+
+Rule retirement
+---------------
+Removing a rule from the config or setting ``enabled: false`` retires it:
+every non-terminal alert it produced is converged to ``closed`` with
+reason ``rule_retired`` (distinguishable from a manual close in the alert
+history). The close commands are journaled, so live state, a restart
+rebuild and a re-replay of the same journals converge to identical
+results. Already-closed alerts are untouched (idempotent), and re-adding
+the rule later can never resurrect a retired conclusion: a firing whose
+``match_key`` is already known is a no-op regardless of lane state.
 """
 from __future__ import annotations
 
@@ -38,6 +51,10 @@ from soc.ingestion import normalize_event
 from soc.rules import RuleSet, build_ruleset
 from soc.store import Store
 from soc.enrichment import LocalIntelProvider
+
+# Close reason recorded when an alert is converged by rule retirement;
+# distinguishable from any operator-supplied reason in the alert history.
+RULE_RETIRED_REASON = "rule_retired"
 
 
 class DetectionService:
@@ -203,24 +220,27 @@ class DetectionService:
                 for firing in detect(rule, key, evs,
                                      version=ruleset.version,
                                      default_window=self.config.window_seconds):
-                    self._record_firing(firing, ruleset, persist=persist)
+                    self._record_firing(firing, ruleset)
 
-    def _record_firing(self, firing: Firing, ruleset: RuleSet,
-                       *, persist: bool = True) -> Alert:
+    def _record_firing(self, firing: Firing, ruleset: RuleSet) -> Alert:
         """Integrate one firing: exact dedupe by match_key, one alert/lane."""
         from soc.enrichment import enrich
         rule = ruleset.get(firing.rule_id)
         severity = rule.severity if rule else "medium"
         lane_id = f"{firing.rule_id}|{firing.group_key}"
-        if persist:
-            # Persist the creation decision first (durable, replayable).
-            cmd = {"type": "create", "match_key": firing.match_key,
-                   "lane_id": lane_id, "rule_id": firing.rule_id,
-                   "severity": severity,
-                   "rule_version": firing.rule_version,
-                   "evidence": firing.evidence().to_dict(),
-                   "ts": firing.events[-1].ts}
-            self.store.append_alert_command(cmd)
+        known = self.alerts_by_key.get(firing.match_key)
+        if known is not None:
+            # Identical conclusion already recorded (possibly long closed):
+            # never resurrect, never double-count, never re-journal.
+            return known
+        # Persist the creation decision first (durable, replayable).
+        cmd = {"type": "create", "match_key": firing.match_key,
+               "lane_id": lane_id, "rule_id": firing.rule_id,
+               "severity": severity,
+               "rule_version": firing.rule_version,
+               "evidence": firing.evidence().to_dict(),
+               "ts": firing.events[-1].ts}
+        self.store.append_alert_command(cmd)
 
         rep = firing.events[-1]
         lane_alert = self.lane_alert.get(lane_id)
@@ -234,8 +254,7 @@ class DetectionService:
                 evidence=[firing.evidence()],
                 representative_event=rep)
             enrich(alert, self.provider)
-            if persist:
-                self._maybe_suppress(alert, ruleset)
+            self._maybe_suppress(alert, ruleset)
             self.alerts_by_key[firing.match_key] = alert
             self.lane_alert[lane_id] = alert
             self.alert_index[alert.id] = alert
@@ -243,15 +262,13 @@ class DetectionService:
 
         # Existing open lane: an identical conclusion is a no-op, otherwise
         # it is a new occurrence merged into the same alert.
-        if firing.match_key not in self.alerts_by_key:
-            lane_alert.record_occurrence(firing.evidence(), rep,
-                                         ts=firing.events[-1].ts)
-            self.alerts_by_key[firing.match_key] = lane_alert
-            self.alert_index.setdefault(lane_alert.id, lane_alert)
-            if lane_alert.state is AlertState.OPEN:
-                enrich(lane_alert, self.provider)
-                if persist:
-                    self._maybe_suppress(lane_alert, ruleset)
+        lane_alert.record_occurrence(firing.evidence(), rep,
+                                     ts=firing.events[-1].ts)
+        self.alerts_by_key[firing.match_key] = lane_alert
+        self.alert_index.setdefault(lane_alert.id, lane_alert)
+        if lane_alert.state is AlertState.OPEN:
+            enrich(lane_alert, self.provider)
+            self._maybe_suppress(lane_alert, ruleset)
         return lane_alert
 
     def _maybe_suppress(self, alert: Alert, ruleset: RuleSet) -> None:
@@ -303,12 +320,49 @@ class DetectionService:
             self.store.save_rules({"version": candidate.version,
                                    "rules": docs,
                                    "suppressions": suppressions or []})
+            retired = self._retired_rule_ids(self.ruleset, candidate)
             self.ruleset = candidate
             self.suppressions = parsed_supp
             self._run_all_detection(candidate)
+            if retired:
+                self._retire_rules(retired, ts=now)
             return {"version": candidate.version,
                     "rule_count": len(candidate.rules),
-                    "suppression_count": len(parsed_supp)}
+                    "suppression_count": len(parsed_supp),
+                    "retired_rules": sorted(retired)}
+
+    @staticmethod
+    def _retired_rule_ids(old: RuleSet, new: RuleSet) -> set[str]:
+        """Rules that were active and are now gone or disabled."""
+        was_active = {r.id for r in old.rules if r.enabled}
+        is_active = {r.id for r in new.rules if r.enabled}
+        return was_active - is_active
+
+    def _retire_rules(self, rule_ids: set[str], *, ts: float) -> None:
+        """Converge every non-terminal alert of retired rules to ``closed``.
+
+        The close is journaled (before the in-memory change is observable)
+        with reason ``rule_retired`` so rebuilds and replays converge to the
+        same conclusion, and so it stays distinguishable from a manual
+        close. Already-closed alerts are skipped: retirement is idempotent
+        and never drags an alert out of a terminal state or appends a
+        contradictory record.
+        """
+        for rule_id in sorted(rule_ids):
+            affected = sorted(
+                (a for a in self.alert_index.values()
+                 if a.rule_id == rule_id
+                 and a.state is not AlertState.CLOSED),
+                key=lambda a: (a.created_ts, a.id))
+            for alert in affected:
+                log_extra = {"rule_id": rule_id}
+                cmd = {"type": "transition", "alert_id": alert.id,
+                       "action": "close", "reason": RULE_RETIRED_REASON,
+                       "ts": ts, "from_state": alert.state.value,
+                       **log_extra}
+                self.store.append_alert_command(cmd)
+                alert.transition("close", ts=ts, reason=RULE_RETIRED_REASON,
+                                 details=log_extra)
 
     # ========================================================== lifecycle
     def transition_alert(self, alert_id: str, action: str,
@@ -343,8 +397,15 @@ class DetectionService:
     def list_alerts(self, state: str | None = None) -> list[dict]:
         with self._lock:
             alerts = list(self.alert_index.values())
-            if state:
+            if state == "all":
+                pass  # explicit opt-in to the full inventory
+            elif state:
                 alerts = [a for a in alerts if a.state.value == state]
+            else:
+                # Default browsing shows unfinished work only; closed alerts
+                # (manual or rule-retirement) remain queryable by id/state.
+                alerts = [a for a in alerts
+                          if a.state is not AlertState.CLOSED]
             return [a.to_dict() for a in sorted(
                 alerts, key=lambda a: (a.created_ts, a.id))]
 
@@ -365,10 +426,12 @@ class DetectionService:
     def _rebuild(self) -> None:
         """Deterministically reconstruct state from journals.
 
-        Events are replayed in their original ingestion order (seq), running
-        detection incrementally just like the live path, so every firing is
-        regenerated with the same match_key but no journal writes occur. The
-        alert command journal is then replayed to restore lifecycle states.
+        Events are re-indexed into lanes in their original ingestion order
+        (seq) so future detection sees the same windows. Alerts themselves
+        are reconstructed purely from the alert command journal (create /
+        transition), in journal order: this reproduces the exact live
+        conclusions - including alerts whose rule was later retired - with
+        identical ids, counts and lifecycle states.
         """
         from soc.models import Event
         raw = self.store.load_rules_raw()
@@ -395,38 +458,70 @@ class DetectionService:
         for ev_d in sorted(accepted, key=lambda d: d["seq"]):
             event = Event(**ev_d)
             self._index_event(event, self.ruleset)
-            self._run_detection_replay_event(event, self.ruleset)
 
         for cmd in self.store.read_alert_commands():
             self._replay_command(cmd)
 
-    def _run_detection_replay_event(self, event, ruleset: RuleSet) -> None:
-        from soc.models import Event
-        for rule in ruleset.rules:
-            if not rule.enabled or not rule.matches_filters(event):
-                continue
-            key = rule.group_key(event)
-            evs = [Event(**d) for d in self.lanes[rule.id][key]]
-            for firing in detect(rule, key, evs, version=ruleset.version,
-                                 default_window=self.config.window_seconds):
-                self._record_firing(firing, ruleset, persist=False)
-
     def _replay_command(self, cmd: dict) -> None:
         ctype = cmd["type"]
         if ctype == "create":
-            return  # alert objects were already regenerated by detection
+            self._replay_create(cmd)
+            return
         if ctype == "transition":
             alert = self.alert_index.get(cmd["alert_id"])
             if alert is None:
                 return
             from soc.errors import InvalidStateTransitionError
+            details = ({"rule_id": cmd["rule_id"]}
+                       if "rule_id" in cmd else None)
             try:
                 alert.transition(cmd["action"], ts=cmd["ts"],
-                                 reason=cmd.get("reason", ""))
+                                 reason=cmd.get("reason", ""),
+                                 details=details)
             except InvalidStateTransitionError:
                 # Already in the target / a terminal state: replaying the
                 # journal repeatedly must converge to identical state.
                 pass
+
+    def _replay_create(self, cmd: dict) -> None:
+        """Materialize one journaled creation decision, mirroring the live
+        ``_record_firing`` integration exactly (no journal writes)."""
+        from soc.alerts import Evidence
+        from soc.enrichment import enrich
+        from soc.models import Event
+        match_key = cmd["match_key"]
+        if match_key in self.alerts_by_key:
+            return  # identical conclusion already integrated
+        ev = cmd["evidence"]
+        evidence = Evidence(
+            rule_id=cmd["rule_id"], rule_version=cmd["rule_version"],
+            group_key=ev["group_key"], window_seconds=ev["window_seconds"],
+            event_ids=tuple(ev["event_ids"]),
+            basis=tuple((ts, seq) for ts, seq in ev["basis"]))
+        rep_d = self.events_by_id.get(evidence.event_ids[-1])
+        rep = Event(**rep_d) if rep_d is not None else None
+        lane_id = cmd["lane_id"]
+        lane_alert = self.lane_alert.get(lane_id)
+        if lane_alert is None or lane_alert.state is AlertState.CLOSED:
+            alert = Alert(
+                id=match_key, dedup_key=lane_id,
+                rule_id=cmd["rule_id"], severity=cmd["severity"],
+                state=AlertState.OPEN,
+                created_ts=evidence.basis[0][0] if evidence.basis else cmd["ts"],
+                updated_ts=cmd["ts"],
+                event_count=len(evidence.event_ids),
+                evidence=[evidence],
+                representative_event=rep)
+            enrich(alert, self.provider)
+            self.alerts_by_key[match_key] = alert
+            self.lane_alert[lane_id] = alert
+            self.alert_index[alert.id] = alert
+            return
+        lane_alert.record_occurrence(evidence, rep, ts=cmd["ts"])
+        self.alerts_by_key[match_key] = lane_alert
+        self.alert_index.setdefault(lane_alert.id, lane_alert)
+        if lane_alert.state is AlertState.OPEN:
+            enrich(lane_alert, self.provider)
 
 
 def _default_clock() -> float:

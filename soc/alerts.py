@@ -122,7 +122,8 @@ class Alert:
 
     # ----------------------------------------------------- lifecycle
     def transition(self, action: str, *, ts: float,
-                   reason: str = "") -> None:
+                   reason: str = "",
+                   details: dict | None = None) -> None:
         current = self.state
         # idempotent no-ops for repeated recovery / close
         if action == "resolve" and current is AlertState.RESOLVED:
@@ -159,9 +160,12 @@ class Alert:
             self.suppressed_by = reason or self.suppressed_by
         elif action == "unsuppress":
             self.suppressed_by = None
-        self.history.append({"action": action, "ts": ts,
-                             "from": current.value, "to": new_state.value,
-                             "reason": reason})
+        entry = {"action": action, "ts": ts,
+                 "from": current.value, "to": new_state.value,
+                 "reason": reason}
+        if details:
+            entry.update(details)
+        self.history.append(entry)
 
     # ----------------------------------------------------- correlation
     def record_occurrence(self, evidence: Evidence, event: Any,

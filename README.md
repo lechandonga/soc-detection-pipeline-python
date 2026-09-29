@@ -32,7 +32,7 @@ Store（soc/store.py）events.jsonl / alerts.jsonl 只追加；rules.json 原子
 
 ```bash
 uv sync                                  # 安装依赖
-uv run pytest -q                         # 全部单测（38 个）
+uv run pytest -q                         # 全部单测（45 个）
 uv run pytest -q -o log_cli=true         # 同时打印输入与判定依据
 uv run fastapi run main.py               # 启动服务
 SOC_DATA_DIR=./data uv run fastapi run main.py   # 开启落盘持久化
@@ -40,7 +40,9 @@ SOC_DATA_DIR=./data uv run fastapi run main.py   # 开启落盘持久化
 
 测试覆盖：畸形事件（每种拒绝理由可区分）、乱序/重复、窗口半开边界、迟到事件、
 规则非法加载与失败回滚、原子规则变更、生命周期非法跳转、抑制、并发摄入、
-并发规则更新 + 告警变更、重启重放一致、容量上限。日志中每条用例都打印
+并发规则更新 + 告警变更、重启重放一致、容量上限、规则撤下（删除/停用收尾、
+撤下后重启与重放一致、下线再上线不复活、撤下与人工并发、失败不留半套收尾）。
+日志中每条用例都打印
 `input=...` 与 `alert=... rule=... events=... basis(ts,seq)=...`。
 
 ## 3. HTTP 接口
@@ -51,7 +53,7 @@ SOC_DATA_DIR=./data uv run fastapi run main.py   # 开启落盘持久化
 | GET  | `/api/v1/events/{id}` | 查询事件结论：accepted / too_late / unknown |
 | GET  | `/api/v1/rules` | 当前不可变规则快照（含版本号） |
 | PUT  | `/api/v1/rules` | 原子替换规则与抑制配置（非法整体拒绝，旧规则不动） |
-| GET  | `/api/v1/alerts?state=` | 列出告警及其证据链 |
+| GET  | `/api/v1/alerts?state=` | 列出告警及其证据链。默认只列"没处理完"的（不含 closed）；`?state=closed` 查已关闭，`?state=all` 查全部 |
 | GET  | `/api/v1/alerts/{id}` | 告警详情（证据、历史、富化上下文） |
 | POST | `/api/v1/alerts/{id}/transition` | 生命周期动作 |
 
@@ -184,7 +186,41 @@ OPEN ◀──────────────────┘               
 * 重复 `resolve` 幂等；`resolve → reopen → close` 连贯；`CLOSED` 为终态。
 * 每次跳转都写入 `history`（action/ts/from/to/reason），并先追加命令日志再改内存。
 
-## 8. 上下文富化
+## 8. 规则撤下（retirement）与收尾
+
+规则调优的高频动作是"撤下"：**从配置里删除该规则**，或**保留配置但置
+`enabled: false`**，两者语义相同。撤下通过常规的 `PUT /api/v1/rules`
+原子替换生效，收尾结论确定：
+
+* **统一收尾**：被撤规则此前产生的所有非终态告警（open/acknowledged/
+  suppressed/resolved）在同一次规则替换内收敛为 `closed`，历史里记录
+  `{"action": "close", "reason": "rule_retired", "rule_id": ...}`——
+  与值班同学手动关闭（reason 为人工填写）明确区分。告警的状态取值与字段
+  不变。
+* **可查不可见**：收尾后的告警仍可按 id（`GET /api/v1/alerts/{id}`）和按
+  状态（`?state=closed` / `?state=all`）查到，证据链、历史、计数完整保留；
+  但默认列表（不带 `state`）只展示"没处理完"的告警，不再出现它们。
+* **终态幂等**：已经是 `closed` 的告警不受撤下影响——不会被拖出终态，
+  也不会追加第二条收尾记录；重复撤下同一规则是空操作。
+* **不复活、不多算**：规则下线后再次上线，已收尾的告警保持 closed，
+  相同事件结论（相同 `match_key`）不会复活旧告警、不会生成重复告警、
+  计数不重算；只有真正的新事件才会在同一 lane 产生新告警（新 id）。
+* **一致性**：收尾的 close 命令与告警创建一样先落 `alerts.jsonl` 再改内存，
+  因此在线状态、重启重建、以及把同一份日志再重放一遍，三者逐条一致
+  （状态、收尾原因、计数），与中间经历过多少次规则变更无关。
+* **失败不留半套**：规则配置整体校验失败时整个 PUT 被拒绝，不发生任何
+  收尾——旧规则、旧告警原样保留。
+* **与人工并发**：撤下与人工 transition 都在同一把锁内串行化，每条告警
+  只有先发生的那个结局生效（后到的人工动作按状态机拒绝或幂等空转），
+  `history` 里的 from/to 链完整反映先后顺序；摄入在撤下期间照常进行。
+
+本地验证：
+
+```bash
+uv run pytest -q tests/test_rule_retirement.py -o log_cli=true
+```
+
+## 9. 上下文富化
 
 告警创建/追加出现时附带本地上下文：
 
@@ -195,16 +231,18 @@ OPEN ◀──────────────────┘               
 * 仅 `status == "hit"` 才令 `threat_hit / asset_hit` 为真；缺信息绝不会被
   当作命中，也不会被静默丢弃。
 
-## 9. 持久化与重启重建
+## 10. 持久化与重启重建
 
 * `events.jsonl`：每条摄入尝试一行（accepted / too_late；被拒绝的不写）。
 * `alerts.jsonl`：先落盘的告警创建与生命周期命令（含规则版本与 match_key）。
 * `rules.json`：临时文件 + `os.replace` 原子写入。
-* 重启时：加载规则 → 按 `seq` 顺序重放事件（纯函数重新检测，稳定 id）
-  → 重放生命周期命令。多次重建收敛到完全相同的告警、计数与状态；
-  再次重放事件流也不会重复计数/重复告警。
+* 重启时：加载规则 → 按 `seq` 顺序重放事件重建检测 lane → **按顺序重放
+  告警命令日志**（create/transition）重建告警。告警以命令日志为准而非
+  重新检测，因此被撤下规则留下的告警（含 `rule_retired` 收尾）在重建后
+  原样保留。多次重建收敛到完全相同的告警、计数与状态；再次重放同一份
+  日志也不会重复计数/重复告警/重复收尾。
 
-## 10. 并发与容量
+## 11. 并发与容量
 
 * 所有公共方法在同一把 `RLock` 内完成"校验 → 落盘 → 改内存"，跨请求不共享
   锁外可变对象；混合并发测试（8 线程摄入 + 持续规则替换 + 状态变更）验证
